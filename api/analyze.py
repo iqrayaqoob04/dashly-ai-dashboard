@@ -4,7 +4,7 @@ from http.server import BaseHTTPRequestHandler
 import pandas as pd
 import numpy as np
 
-INTENTS={"row_count","count","percentage","prevalence","sum","average","median","min","max","group_comparison","distribution","correlation","trend","ranking","missing_values","unique_values"}
+INTENTS={"row_count","count","percentage","prevalence","conditional_count","conditional_percentage","sum","average","median","min","max","group_comparison","distribution","correlation","trend","ranking","missing_values","unique_values"}
 YES={"yes","y","true","1","positive"}; NO={"no","n","false","0","negative"}
 
 def tokens(value):
@@ -12,6 +12,9 @@ def tokens(value):
 
 def normalized(s):
     return s.astype("string").str.strip().str.lower()
+
+def similar(a,b):
+    return a==b or (len(a)>=4 and len(b)>=4 and a[:4]==b[:4])
 
 def profile(df):
     out=[]
@@ -36,6 +39,20 @@ def match_column(question, schema, kinds=None):
     ranked.sort(reverse=True)
     if len(ranked)>1 and ranked[0][0]==ranked[1][0]: return None
     return ranked[0][1]
+
+def matching_columns(question, schema, kinds):
+    q=tokens(question); found=[]
+    for item in schema:
+        if item["kind"] not in kinds: continue
+        name=tokens(item["name"]); matches=[i for i,w in enumerate(q) if any(similar(w,n) for n in name)]
+        sample_matches=[i for i,w in enumerate(q) if any(similar(w,v) for sample in item.get("samples",[]) for v in tokens(sample))]
+        if matches or sample_matches: found.append((min(matches+sample_matches),item["name"]))
+    return [name for _,name in sorted(found)]
+
+def values_for_condition(question, schema, column):
+    samples=next(x["samples"] for x in schema if x["name"]==column)
+    mentioned=[w for v in samples for w in tokens(v) if w in tokens(question)]
+    return mentioned or list(YES)
 
 def intent_for(q):
     q=q.lower()
@@ -63,9 +80,15 @@ def plan(question,schema):
     condition=match_column(question,schema,{"categorical"})
     if intent in {"row_count"}: return {"intent":intent}
     if intent in {"count","percentage"}:
+        conditions=matching_columns(question,schema,{"categorical"})
+        if len(conditions)>=2:
+            if re.search(r"due to|because of|caused by|causes",q):
+                raise ValueError("I can measure the observed relationship between these variables, but this dataset cannot establish causation. Please clarify: do you want the percentage within the first group, or the percentage of all records that meet both conditions?")
+            condition_specs=[{"column":col,"values":values_for_condition(question,schema,col)} for col in conditions]
+            denominator=[] if re.search(r"all (patients|records|customers)|entire dataset|all rows",q) else [condition_specs[0]]
+            return {"intent":"conditional_percentage" if intent=="percentage" else "conditional_count","numerator_conditions":condition_specs,"denominator_conditions":denominator}
         if not condition: raise ValueError("I couldn't determine which category or condition to count. Please name it, for example 'patients with lung cancer'.")
-        samples=next(x["samples"] for x in schema if x["name"]==condition); mentioned=[w for v in samples for w in tokens(v) if w in tokens(question)]
-        positives=mentioned or list(YES)
+        positives=values_for_condition(question,schema,condition)
         return {"intent":"prevalence" if intent=="percentage" else "count","condition_column":condition,"positive_values":positives}
     if intent in {"average","median","sum","min","max"}:
         if not numeric: raise ValueError("I couldn't determine the numeric column. Please specify the metric, for example 'average age'.")
@@ -91,6 +114,17 @@ def condition_mask(df,col,positive_values=YES):
     # If no Yes-like encoding, use explicitly mentioned category value when it uniquely occurs.
     return positives, int(values.notna().sum())
 
+def conditions_mask(df, conditions):
+    mask=pd.Series(True,index=df.index)
+    for condition in conditions:
+        col=condition["column"]
+        if col not in df.columns: raise ValueError(f"Referenced column {col} is not in the dataset.")
+        values=set(condition["values"])
+        current=normalized(df[col]).isin(values)
+        if not current.any(): raise ValueError(f"No values matching {col} = {condition['values'][0]} were found.")
+        mask &= current
+    return mask
+
 def execute(df,p):
     intent=p["intent"]; n=len(df)
     if not n: raise ValueError("The dataset has no rows.")
@@ -98,6 +132,18 @@ def execute(df,p):
     if intent=="row_count":
         result["answer"]=f"There are {n:,} records in the dataset."
         result["kpis"]=[["Dataset rows",n,"Calculated with len(df)"]]; result["provenance"]=[f"Calculated from {n:,} dataset rows using len(df)."]
+    elif intent in {"conditional_count","conditional_percentage"}:
+        numerator=conditions_mask(df,p["numerator_conditions"])
+        denominator=conditions_mask(df,p["denominator_conditions"]) if p["denominator_conditions"] else pd.Series(True,index=df.index)
+        numerator_count,denominator_count=int(numerator.sum()),int(denominator.sum())
+        if denominator_count==0 or numerator_count>denominator_count or (numerator & ~denominator).any(): raise ValueError("Conditional-analysis sanity check failed.")
+        percentage=numerator_count/denominator_count*100
+        labels=[" AND ".join(f"{c['column']} = {c['values'][0]}" for c in p["numerator_conditions"])]
+        scope="all dataset rows" if not p["denominator_conditions"] else " AND ".join(f"{c['column']} = {c['values'][0]}" for c in p["denominator_conditions"])
+        result["kpis"]=[["Matching records",numerator_count,labels[0]],["Denominator",denominator_count,scope],["Percentage",f"{percentage:.2f}%","Matching records ÷ denominator"]]
+        result["answer"]=f"{numerator_count:,} of {denominator_count:,} records meet both conditions, representing {percentage:.2f}%." if intent=="conditional_percentage" else f"{numerator_count:,} records meet both conditions."
+        result["chart"]={"type":"bar","title":"Conditional analysis result","labels":["Meet both conditions","Denominator only"],"values":[numerator_count,denominator_count-numerator_count]}
+        result["provenance"]=[f"Dataset rows: {n:,}.",f"Numerator: {labels[0]}.",f"Denominator: {scope}.",f"Formula: {numerator_count} ÷ {denominator_count} × 100 = {percentage:.2f}%.", "This is an observed relationship and does not establish causation."]
     elif intent in {"count","prevalence"}:
         col=p["condition_column"]; mask,valid=condition_mask(df,col,p.get("positive_values",YES)); count=int(mask.sum())
         if valid==0: raise ValueError(f"{col} has no usable values.")

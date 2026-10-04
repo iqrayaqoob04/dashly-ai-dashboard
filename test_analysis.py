@@ -12,4 +12,16 @@ assert run("Compare peer pressure by lung cancer")["chart"]["values"] == [2.5,2.
 assert run("Show the number of patients by gender")["chart"]["values"] == [2,2]
 assert run("What percentage of patients are male?")["kpis"][2][1] == "50.00%"
 assert run("What is the average age?")["kpis"][0][1] == "35.00"
-print("All deterministic analysis tests passed.")
+
+conditional=pd.DataFrame({"SMOKING":["Yes","Yes","Yes","No","No"],"LUNG_CANCER":["Yes","No","Yes","No","Yes"]})
+conditional_schema=profile(conditional)
+def conditional_run(q): return execute(conditional,plan(q,conditional_schema))
+assert conditional_run("What percentage of smokers have lung cancer?")["kpis"][2][1] == "66.67%"
+assert conditional_run("How many smokers have lung cancer?")["kpis"][0][1] == 2
+assert conditional_run("What percentage of all patients both smoke and have lung cancer?")["kpis"][2][1] == "40.00%"
+try:
+    conditional_run("What percentage have lung cancer due to smoking?")
+    raise AssertionError("Causal wording should ask for clarification")
+except ValueError as error:
+    assert "cannot establish causation" in str(error)
+print("All deterministic and conditional-analysis tests passed.")
